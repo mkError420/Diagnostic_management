@@ -1,0 +1,227 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  release:
+    types: [published]
+
+jobs:
+  # Test job
+  test:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run linting
+        run: npm run lint
+      
+      - name: Run type checking
+        run: npm run type-check
+      
+      - name: Run tests
+        run: npm test
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
+          JWT_SECRET: test-jwt-secret
+          NODE_ENV: test
+      
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage/lcov.info
+          flags: unittests
+          name: codecov-umbrella
+
+  # Build job
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18.x'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Build application
+        run: npm run build
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-${{ github.sha }}
+          path: dist/
+          retention-days: 7
+
+  # Security scan
+  security:
+    needs: test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Run security audit
+        run: npm audit --audit-level high
+      
+      - name: Run Snyk security scan
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+  # Deploy to staging
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    
+    environment: staging
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Deploy to staging
+        run: |
+          echo "Deploying to staging environment"
+          # Add your staging deployment commands here
+          # For example:
+          # docker build -t clinic-app:staging .
+          # docker push your-registry/clinic-app:staging
+          # kubectl set image deployment/clinic-app:staging clinic-app:staging
+
+  # Deploy to production
+  deploy-production:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event == 'release'
+    
+    environment: production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Deploy to production
+        run: |
+          echo "Deploying to production environment"
+          # Add your production deployment commands here
+          # For example:
+          # docker build -t clinic-app:latest .
+          # docker push your-registry/clinic-app:latest
+          # kubectl set image deployment/clinic-app:production clinic-app:latest
+          # kubectl rollout status deployment/clinic-app:production
+
+  # Database migrations
+  migrate:
+    needs: [deploy-staging, deploy-production]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop' || github.event == 'release'
+    
+    environment:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18.x'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run database migrations
+        run: npm run migrate
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NODE_ENV: production
+
+  # Health check
+  health-check:
+    needs: [deploy-staging, deploy-production]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop' || github.event == 'release'
+    
+    steps:
+      - name: Health check staging
+        run: |
+          echo "Checking staging health"
+          # Add health check commands for staging
+          curl -f https://staging.yourdomain.com/api/health || exit 1
+      
+      - name: Health check production
+        if: github.event == 'release'
+          run: |
+            echo "Checking production health"
+            # Add health check commands for production
+            curl -f https://yourdomain.com/api/health || exit 1
+
+  # Notify on success/failure
+  notify:
+    needs: [test, build, deploy-staging, deploy-production, migrate, health-check]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Notify on success
+        if: needs.deploy-staging.result == 'success' || needs.deploy-production.result == 'success'
+          run: |
+            echo "Deployment successful!"
+            # Add notification logic (Slack, email, etc.)
+            # curl -X POST -H 'Content-Type: application/json' \
+            #   -d '{"text":"Deployment successful!"}' \
+            #   ${{ secrets.SLACK_WEBHOOK_URL }}
+      
+      - name: Notify on failure
+        if: needs.deploy-staging.result == 'failure' || needs.deploy-production.result == 'failure'
+          run: |
+            echo "Deployment failed!"
+            # Add notification logic (Slack, email, etc.)
+            # curl -X POST -H 'Content-Type: application/json' \
+            #   -d '{"text":"Deployment failed!"}' \
+            #   ${{ secrets.SLACK_WEBHOOK_URL }}
